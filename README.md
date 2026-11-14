@@ -26,7 +26,7 @@ Supply your own game files. Atari ST requires `tos.img` in `/dev_hdd0/atari/bios
 - Left/Right: change blades. Up/Down: select a game.
 - X: launch. Triangle: rescan. Circle: return to XMB.
 - In a game, hold Select + Start for one second to return to the launcher.
-- The system menu�s quit action returns to XMB.
+- The system menu’s quit action returns to XMB.
 
 User data lives in `/dev_hdd0/atari/`, outside the installed application folder.
 

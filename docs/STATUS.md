@@ -1,4 +1,4 @@
-# Atari4PS3 � development status
+# Atari4PS3 — development status
 
 **Proven:** the launcher and seven runner ELFs compile/link. A finalized local test package contains eight valid SELF files. Its size is 14,130,496 bytes and its SHA-256 is `489b5db5df3f7a1e4a17411db7241f256d5de5c52c8dc4ac549bdc0269a61c43`.
 

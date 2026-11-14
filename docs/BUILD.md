@@ -10,11 +10,11 @@ Initialize submodules with `git submodule update --init --recursive`. Exact top-
 
 - `shim/std/`: the threading support needed by the PS3 libstdc++ build.
 - `shim/pthread/`: LV2-backed pthread operations used by DOSBox Pure.
-- `shim/compat/memory.h`: legacy memory declarations from the SDK�s real `string.h`.
+- `shim/compat/memory.h`: legacy memory declarations from the SDK’s real `string.h`.
 - `shim/compat/ftime_ps3.cxx`: DOSBox wall-clock milliseconds from `gettimeofday`.
-- `shim/fenv/`: real PPU rounding control. The missing `log2l` delegates to `log2` only with a compile-time check that this SDK�s double and long double formats have equal size and precision. Unsupported exception APIs are not faked.
+- `shim/fenv/`: real PPU rounding control. The missing `log2l` delegates to `log2` only with a compile-time check that this SDK’s double and long double formats have equal size and precision. Unsupported exception APIs are not faked.
 - `shim/wrap/`: compiler flags without editing the upstream core trees.
 
-Some static cores omit libretro-common frontend helpers; the Makefile compiles the matching helper sources from each core�s own tree. Handy�s missing PS3 definitions are supplied by the newer ProSystem include tree. Runner archive prerequisites use GNU make secondary expansion.
+Some static cores omit libretro-common frontend helpers; the Makefile compiles the matching helper sources from each core’s own tree. Handy’s missing PS3 definitions are supplied by the newer ProSystem include tree. Runner archive prerequisites use GNU make secondary expansion.
 
 The software SDL renderer is preferred, following earlier hardware observations. Timer callbacks and input polling continue while an idle launcher avoids unnecessary presents. Current hardware verification is still required.
