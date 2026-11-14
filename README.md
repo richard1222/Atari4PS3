@@ -62,3 +62,7 @@ Host checks cover audio queue ordering and wraparound, save-folder separation an
 Recent fixes include synchronized audio buffering, separate 8-bit/5200 saves, respecting quit requests on warning screens, stopping the watchdog before SDL shutdown, and PS3 SDK compatibility fixes. See [status](docs/STATUS.md) and [PS3 test checklist](docs/HARDWARE_TEST.md).
 
 Core sources remain upstream submodules. PS3 compatibility code lives in `shim/`; licenses and notices are in [LICENSES](LICENSES/README.md).
+
+## License
+
+Atari4PS3-owned code is GPL-2.0-or-later; see [LICENSE](LICENSE). Emulator cores and third-party components retain their own licenses; see [notices](LICENSES/README.md).
