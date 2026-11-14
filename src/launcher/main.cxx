@@ -268,7 +268,12 @@ static int scan_blade(struct Blade* b) {
       memcpy(full + fl + 1, de->d_name, nl + 1);
       struct stat st;
       long sz = -1;
-      if (stat(full, &st) == 0) sz = (long)st.st_size;
+      if (stat(full, &st) == 0) {
+        /* A directory named like a ROM (e.g. a "game.zip" folder) is
+         * not a loadable file: skip it instead of listing it. */
+        if (S_ISDIR(st.st_mode)) continue;
+        sz = (long)st.st_size;
+      }
       copy_capped(b->roms[b->count].name, NAME_LEN, de->d_name);
       b->roms[b->count].size = sz;
       b->count++;

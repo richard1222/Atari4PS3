@@ -83,6 +83,9 @@ static int g_frame_ready = 0;
 static struct A4Pad g_pad;
 static int g_quit = 0;
 static int g_sys_exit = 0; /* PS-button quit: exit to XMB, no spawn-back */
+/* Short reason for a run_game failure, shown on the load-error screen
+ * (hardening pass: failures must be visible, not just logged). */
+static char g_load_error[96] = "";
 static uint32_t g_quit_hold_t0 = 0;
 static unsigned g_frames_run = 0;
 static char g_hint[64] = ""; /* handshake line 3 (atari800 system) */
@@ -264,6 +267,14 @@ static bool env_cb(unsigned cmd, void* data) {
       return true;
     case RETRO_ENVIRONMENT_GET_CAN_DUPE:
       if (data) *(bool*)data = true;
+      return true;
+    case RETRO_ENVIRONMENT_SHUTDOWN:
+      /* The core asked to exit (e.g. DOSBox's own exit, Stella's
+       * quit): honor it by ending the run and returning to the
+       * launcher. Ignoring it left the game running with no visible
+       * effect. */
+      a4_log("runner", "core requested SHUTDOWN");
+      g_quit = 1;
       return true;
     default:
       return false;
@@ -572,6 +583,8 @@ static int run_game(const char* rompath) {
   if (!path_only) {
     if (!a4_read_file(rompath, &data, &size)) {
       a4_log("runner", "cannot read ROM %s", rompath);
+      snprintf(g_load_error, sizeof g_load_error,
+               "Could not read the ROM file");
       retro_deinit();
       return 0;
     }
@@ -579,6 +592,7 @@ static int run_game(const char* rompath) {
   } else {
     if (!a4_is_file(rompath)) {
       a4_log("runner", "ROM file missing: %s", rompath);
+      snprintf(g_load_error, sizeof g_load_error, "ROM file is missing");
       retro_deinit();
       return 0;
     }
@@ -593,6 +607,8 @@ static int run_game(const char* rompath) {
   a4_watchdog_phase(A4_PHASE_LOAD);
   if (!retro_load_game(&gi)) {
     a4_log("runner", "retro_load_game FAILED");
+    snprintf(g_load_error, sizeof g_load_error,
+             "The core rejected this file");
     free(data);
     retro_deinit();
     return 0;
@@ -888,13 +904,18 @@ int main(int argc, char** argv) {
     if (!bios_blocked && !g_sys_exit) {
       played = run_game(rompath);
       if (!played) {
-        a4_log("runner", "showing load-error screen");
-        wait_screen(150, 30, 60, 5000);
+        a4_log("runner", "showing load-error screen: %s", g_load_error);
+        wait_screen_msg("LOAD FAILED",
+                        g_load_error[0] ? g_load_error : "Unknown load error",
+                        "See m0.log for details.", 150, 30, 60, 8000);
       }
     }
   } else {
     a4_log("runner", "no ROM: showing no-ROM screen (any button returns, 30s timeout)");
-    int why = wait_screen(30, 40, 120, 30000);
+    int why = wait_screen_msg("NO ROM RECEIVED",
+                              "The launcher sent no game path.",
+                              "Check m0.log, then press any button.",
+                              30, 40, 120, 30000);
     a4_log("runner", "no-ROM screen exit: %s", why ? "timeout" : "button");
   }
 

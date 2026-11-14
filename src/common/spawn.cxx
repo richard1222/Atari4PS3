@@ -10,9 +10,13 @@ void a4_spawn(const char* path, const char* arg1) {
   argv[0] = path;
   argv[1] = arg1 ? arg1 : "";
   argv[2] = NULL;
-  /* Priority 0, 1 MiB main-thread stack for the new process. This call
-   * returns only on error; on success the current process is replaced. */
-  sysProcessExitSpawn2(path, argv, NULL, NULL, 0, 0,
+  /* Priority 1001, 1 MiB main-thread stack for the new process. This
+   * call returns only on error; on success the current process is
+   * replaced. 1001 is the priority every known-working exitspawn2
+   * caller uses (PS3LoadX, Cobra ntfs_ext_iso examples) and matches
+   * LV2's normal process priority; the M0/M2 builds passed 0, which
+   * no working example uses. Fixed in the hardening pass, 2026-11-14. */
+  sysProcessExitSpawn2(path, argv, NULL, NULL, 0, 1001,
                        SYS_PROCESS_SPAWN_STACK_SIZE_1M);
 }
 
