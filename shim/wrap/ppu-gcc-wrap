@@ -1,0 +1,24 @@
+#!/bin/sh
+# ppu-gcc wrapper for vendored libretro core builds (M2).
+#
+# Problem: the template libretro Makefiles build CFLAGS/CXXFLAGS with
+# `+=` from their platform blocks, and a command-line CFLAGS=...
+# REPLACES the whole variable (GNU make: command-line values win and
+# `+=` does not append to them -- verified). Passing flags on the
+# command line would silently drop -D__PS3__, -DMSB_FIRST, etc.
+# VirtualJaguar's own Makefile warns about exactly this.
+#
+# Solution: pass this script as CC=/path/to/ppu-gcc-wrap. The core's
+# Makefile keeps its own flag logic untouched, and the PS3/newlib
+# flags ride along from here, before the Makefile's flags (so an
+# upstream flag still wins on a direct conflict).
+#
+# Flags: Cell CPU + hard float (matches the launcher/runner build),
+# -U__STRICT_ANSI__ (newlib hides C99 declarations under strict ANSI;
+# the cores need snprintf/strtof/etc.), -Wno-cpp (the -U triggers a
+# cpp warning otherwise), and the PSL1GHT include dir for <sys/*.h>.
+# The C wrapper deliberately has NO -include: the C99 shim header is
+# C++-only (overloads); C translation units get the declarations from
+# newlib once __STRICT_ANSI__ is undefined.
+PS3DEV="${PS3DEV:-/opt/ps3sdk}"
+exec "$PS3DEV/ppu/bin/ppu-gcc" -mcpu=cell -mhard-float -U__STRICT_ANSI__ -Wno-cpp -I"$PS3DEV/ppu/include" "$@"

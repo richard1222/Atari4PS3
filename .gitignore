@@ -1,0 +1,15 @@
+/build/
+/build-logs/
+*.o
+*.d
+*.a
+*.elf
+*.self
+*.pkg
+*.log
+*.pre-*
+__pycache__/
+.DS_Store
+/roms/
+/bios/
+/saves/

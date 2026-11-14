@@ -1,0 +1,174 @@
+// Shadow <condition_variable> for PSL1GHT.
+//
+// The ps3toolchain libstdc++ was built without gthreads, so the system
+// <condition_variable> declares nothing. This file is found first via -I
+// and replaces it for the Stella core build only. Backed by LV2 sysCond
+// syscalls.
+//
+// Provided: std::cv_status, std::condition_variable (wait / wait_for /
+// wait_until, each with and without a predicate).
+// Deliberately NOT provided: condition_variable_any -- Stella's libretro
+// build never uses it (verified by grep, 2026-11-14).
+//
+// LV2 CONSTRAINT: an LV2 condition variable is bound to ONE mutex at
+// creation (sysCondCreate takes the mutex). This class creates its sysCond
+// lazily on the first wait(), bound to that wait's mutex. Every
+// condition_variable in Stella is always used with the same mutex, so the
+// binding never changes in practice. If a different mutex ever arrives,
+// the sysCond is destroyed and recreated bound to the new one; that path
+// assumes no thread is currently waiting (the standard already makes
+// destroying a condition variable with waiters undefined behaviour).
+#ifndef A4_PS3_SHIM_CONDITION_VARIABLE
+#define A4_PS3_SHIM_CONDITION_VARIABLE
+
+// Keep the real libstdc++ <condition_variable> from ever being parsed.
+#define _GLIBCXX_CONDITION_VARIABLE 1
+
+#include "__a4_detail.h"
+#include "mutex"
+
+#include <chrono>
+#include <ratio>
+#include <system_error>
+
+namespace std {
+
+enum class cv_status { no_timeout, timeout };
+
+class condition_variable {
+ public:
+  condition_variable() noexcept : cond_(0), bound_(0) {}
+
+  ~condition_variable() {
+    const std::uint64_t c = cond_.load(std::memory_order_relaxed);
+    if (c != 0) sysCondDestroy(static_cast<sys_cond_t>(c));
+  }
+
+  condition_variable(const condition_variable&) = delete;
+  condition_variable& operator=(const condition_variable&) = delete;
+
+  void notify_one() noexcept {
+    const std::uint64_t c = cond_.load(std::memory_order_acquire);
+    if (c != 0) sysCondSignal(static_cast<sys_cond_t>(c));
+  }
+
+  void notify_all() noexcept {
+    const std::uint64_t c = cond_.load(std::memory_order_acquire);
+    if (c != 0) sysCondBroadcast(static_cast<sys_cond_t>(c));
+  }
+
+  void wait(unique_lock<mutex>& lock) {
+    const sys_cond_t c = ensure(lock.mutex()->native_handle());
+    // sysCondWait atomically releases the bound mutex, waits, and
+    // re-acquires it before returning. Timeout 0 = wait forever, so a
+    // nonzero return is an error, not a timeout.
+    if (sysCondWait(c, 0) != 0)
+      throw system_error(make_error_code(errc::resource_deadlock_would_occur),
+                         "sysCondWait");
+  }
+
+  template <typename _Predicate>
+  void wait(unique_lock<mutex>& lock, _Predicate pred) {
+    while (!pred()) wait(lock);
+  }
+
+  template <typename _Rep, typename _Period>
+  cv_status wait_for(unique_lock<mutex>& lock,
+                     const chrono::duration<_Rep, _Period>& rel_time) {
+    if (rel_time <= chrono::duration<_Rep, _Period>::zero())
+      return cv_status::timeout;
+    const std::uint64_t usec = toUsec(rel_time);
+    const sys_cond_t c = ensure(lock.mutex()->native_handle());
+    const auto start = chrono::steady_clock::now();
+    if (sysCondWait(c, usec) == 0) return cv_status::no_timeout;
+    // Nonzero: timeout or error. Distinguish by elapsed time so a spurious
+    // early return is reported as a wakeup (callers re-check their state).
+    const auto elapsed = chrono::steady_clock::now() - start;
+    if (elapsed >= rel_time) return cv_status::timeout;
+    return cv_status::no_timeout;
+  }
+
+  template <typename _Rep, typename _Period, typename _Predicate>
+  bool wait_for(unique_lock<mutex>& lock,
+                const chrono::duration<_Rep, _Period>& rel_time,
+                _Predicate pred) {
+    while (!pred()) {
+      if (wait_for(lock, rel_time) == cv_status::timeout) return pred();
+    }
+    return true;
+  }
+
+  template <typename _Clock, typename _Duration>
+  cv_status wait_until(
+      unique_lock<mutex>& lock,
+      const chrono::time_point<_Clock, _Duration>& abs_time) {
+    const auto now = _Clock::now();
+    if (now >= abs_time) return cv_status::timeout;
+    const cv_status st = wait_for(lock, abs_time - now);
+    if (st == cv_status::timeout) return cv_status::timeout;
+    return (_Clock::now() >= abs_time) ? cv_status::timeout
+                                       : cv_status::no_timeout;
+  }
+
+  template <typename _Clock, typename _Duration, typename _Predicate>
+  bool wait_until(unique_lock<mutex>& lock,
+                  const chrono::time_point<_Clock, _Duration>& abs_time,
+                  _Predicate pred) {
+    while (!pred()) {
+      if (wait_until(lock, abs_time) == cv_status::timeout) return pred();
+    }
+    return true;
+  }
+
+ private:
+  // Convert a positive duration to microseconds, saturating so that huge
+  // durations cannot overflow the conversion, and never returning 0
+  // (sysCondWait treats 0 as "wait forever").
+  template <typename _Rep, typename _Period>
+  static std::uint64_t toUsec(const chrono::duration<_Rep, _Period>& d) {
+    using namespace chrono;
+    constexpr auto kMax = hours(24LL * 365 * 100);  // ~100 years
+    if (d > kMax)
+      return static_cast<std::uint64_t>(
+          duration_cast<microseconds>(kMax).count());
+    const auto us = duration_cast<microseconds>(d).count();
+    if (us <= 0) return 1;
+    return static_cast<std::uint64_t>(us);
+  }
+
+  sys_cond_t ensure(sys_mutex_t m) {
+    std::uint64_t c = cond_.load(std::memory_order_acquire);
+    if (c != 0 && bound_.load(std::memory_order_relaxed) ==
+                      static_cast<std::uint64_t>(m))
+      return static_cast<sys_cond_t>(c);
+    a4_shim::SpinGuard guard(createLock_);
+    c = cond_.load(std::memory_order_relaxed);
+    if (c != 0) {
+      if (bound_.load(std::memory_order_relaxed) ==
+          static_cast<std::uint64_t>(m))
+        return static_cast<sys_cond_t>(c);
+      // Rebind to a different mutex; assumes no current waiters (see the
+      // header comment). Never happens with Stella's usage.
+      sysCondDestroy(static_cast<sys_cond_t>(c));
+      cond_.store(0, std::memory_order_relaxed);
+    }
+    sys_cond_attr_t attr;
+    sysCondAttrInitialize(attr);
+    sys_cond_t created = 0;
+    if (sysCondCreate(&created, m, &attr) != 0)
+      throw system_error(make_error_code(errc::resource_unavailable_try_again),
+                         "sysCondCreate");
+    bound_.store(static_cast<std::uint64_t>(m), std::memory_order_relaxed);
+    cond_.store(static_cast<std::uint64_t>(created),
+                std::memory_order_release);
+    return created;
+  }
+
+  std::atomic<std::uint64_t> cond_;   // 0 = not created yet
+  std::atomic<std::uint64_t> bound_;  // mutex handle the cond is bound to
+  a4_shim::SpinLock createLock_;
+};
+
+}  // namespace std
+
+#endif  // A4_PS3_SHIM_CONDITION_VARIABLE

@@ -1,0 +1,304 @@
+// Shadow <mutex> for PSL1GHT.
+//
+// The ps3toolchain libstdc++ was built without gthreads, so the system
+// <mutex> declares nothing. This file is found first via -I and replaces
+// it for the Stella core build only. Backed by LV2 sysMutex syscalls.
+//
+// Provided: std::mutex, std::recursive_mutex, std::lock_guard,
+// std::unique_lock, and the defer/try-to/adopt lock tags.
+// Deliberately NOT provided: timed_mutex, recursive_timed_mutex,
+// shared_mutex, once_flag/call_once, std::lock -- Stella's libretro build
+// uses none of them (verified by grep, 2026-11-14).
+//
+// Kernel mutexes are created lazily on first lock(): that keeps
+// statically-constructed mutexes safe (no syscall runs during static init)
+// and keeps uncontended destruction free.
+#ifndef A4_PS3_SHIM_MUTEX
+#define A4_PS3_SHIM_MUTEX
+
+// Keep the real libstdc++ <mutex> from ever being parsed in this TU.
+#define _GLIBCXX_MUTEX 1
+
+#include "__a4_detail.h"
+
+#include <chrono>
+#include <memory>
+#include <system_error>
+#include <utility>
+
+namespace a4_shim {
+
+// Shared lazy sysMutex storage. Handles are kept as u64: LV2 object ids fit
+// in 64 bits whatever the SDK typedefs them as.
+class LazySysMutex {
+  std::atomic<std::uint64_t> handle_{0};
+  SpinLock createLock_;
+  bool recursive_;
+
+ protected:
+  explicit LazySysMutex(bool recursive) noexcept : recursive_(recursive) {}
+  ~LazySysMutex() {
+    const std::uint64_t h = handle_.load(std::memory_order_relaxed);
+    if (h != 0) sysMutexDestroy(static_cast<sys_mutex_t>(h));
+  }
+  LazySysMutex(const LazySysMutex&) = delete;
+  LazySysMutex& operator=(const LazySysMutex&) = delete;
+
+  sys_mutex_t ensure() {
+    std::uint64_t h = handle_.load(std::memory_order_acquire);
+    if (h != 0) return static_cast<sys_mutex_t>(h);
+    SpinGuard guard(createLock_);
+    h = handle_.load(std::memory_order_relaxed);
+    if (h != 0) return static_cast<sys_mutex_t>(h);
+    sys_mutex_attr_t attr;
+    sysMutexAttrInitialize(attr);
+    if (recursive_) attr.attr_recursive = SYS_MUTEX_ATTR_RECURSIVE;
+    sys_mutex_t created = 0;
+    if (sysMutexCreate(&created, &attr) != 0)
+      throw std::system_error(
+          std::make_error_code(std::errc::resource_unavailable_try_again),
+          "sysMutexCreate");
+    handle_.store(static_cast<std::uint64_t>(created),
+                  std::memory_order_release);
+    return created;
+  }
+
+  sys_mutex_t peek() const noexcept {
+    return static_cast<sys_mutex_t>(handle_.load(std::memory_order_relaxed));
+  }
+};
+
+}  // namespace a4_shim
+
+namespace std {
+
+struct defer_lock_t {
+  explicit defer_lock_t() = default;
+};
+struct try_to_lock_t {
+  explicit try_to_lock_t() = default;
+};
+struct adopt_lock_t {
+  explicit adopt_lock_t() = default;
+};
+inline constexpr defer_lock_t defer_lock{};
+inline constexpr try_to_lock_t try_to_lock{};
+inline constexpr adopt_lock_t adopt_lock{};
+
+class mutex : private a4_shim::LazySysMutex {
+ public:
+  typedef sys_mutex_t native_handle_type;
+
+  mutex() noexcept : LazySysMutex(false) {}
+  ~mutex() = default;
+  mutex(const mutex&) = delete;
+  mutex& operator=(const mutex&) = delete;
+
+  void lock() {
+    const sys_mutex_t h = ensure();
+    const s32 ret = sysMutexLock(h, 0);  // 0 = wait forever
+    if (ret != 0)
+      throw system_error(error_code(ret < 0 ? -ret : ret, generic_category()),
+                         "sysMutexLock");
+  }
+
+  bool try_lock() {
+    const sys_mutex_t h = ensure();
+    return sysMutexTryLock(h) == 0;
+  }
+
+  void unlock() noexcept {
+    const sys_mutex_t h = peek();
+    if (h != 0) sysMutexUnlock(h);
+    // Unlocking a never-locked mutex is undefined behaviour per the
+    // standard; silently ignoring the uncreated case avoids crashing on
+    // odd destruction orders.
+  }
+
+  native_handle_type native_handle() { return ensure(); }
+};
+
+class recursive_mutex : private a4_shim::LazySysMutex {
+ public:
+  typedef sys_mutex_t native_handle_type;
+
+  recursive_mutex() noexcept : LazySysMutex(true) {}
+  ~recursive_mutex() = default;
+  recursive_mutex(const recursive_mutex&) = delete;
+  recursive_mutex& operator=(const recursive_mutex&) = delete;
+
+  void lock() {
+    const sys_mutex_t h = ensure();
+    const s32 ret = sysMutexLock(h, 0);
+    if (ret != 0)
+      throw system_error(error_code(ret < 0 ? -ret : ret, generic_category()),
+                         "sysMutexLock");
+  }
+
+  bool try_lock() {
+    const sys_mutex_t h = ensure();
+    return sysMutexTryLock(h) == 0;
+  }
+
+  void unlock() noexcept {
+    const sys_mutex_t h = peek();
+    if (h != 0) sysMutexUnlock(h);
+  }
+
+  native_handle_type native_handle() { return ensure(); }
+};
+
+template <typename _Mutex>
+class lock_guard {
+ public:
+  typedef _Mutex mutex_type;
+
+  explicit lock_guard(mutex_type& m) : m_(m) { m_.lock(); }
+  lock_guard(mutex_type& m, adopt_lock_t) noexcept : m_(m) {}
+  ~lock_guard() { m_.unlock(); }
+
+  lock_guard(const lock_guard&) = delete;
+  lock_guard& operator=(const lock_guard&) = delete;
+
+ private:
+  mutex_type& m_;
+};
+
+template <typename _Mutex>
+class unique_lock {
+ public:
+  typedef _Mutex mutex_type;
+
+  unique_lock() noexcept : m_(nullptr), owns_(false) {}
+
+  explicit unique_lock(mutex_type& m) : m_(std::addressof(m)), owns_(false) {
+    lock();
+  }
+
+  unique_lock(mutex_type& m, defer_lock_t) noexcept
+      : m_(std::addressof(m)), owns_(false) {}
+
+  unique_lock(mutex_type& m, try_to_lock_t)
+      : m_(std::addressof(m)), owns_(m.try_lock()) {}
+
+  unique_lock(mutex_type& m, adopt_lock_t) noexcept
+      : m_(std::addressof(m)), owns_(true) {}
+
+  template <typename _Rep, typename _Period>
+  unique_lock(mutex_type& m,
+              const chrono::duration<_Rep, _Period>& rel_time)
+      : m_(std::addressof(m)), owns_(m.try_lock_for(rel_time)) {}
+
+  template <typename _Clock, typename _Duration>
+  unique_lock(mutex_type& m,
+              const chrono::time_point<_Clock, _Duration>& abs_time)
+      : m_(std::addressof(m)), owns_(m.try_lock_until(abs_time)) {}
+
+  ~unique_lock() {
+    if (owns_) m_->unlock();
+  }
+
+  unique_lock(const unique_lock&) = delete;
+  unique_lock& operator=(const unique_lock&) = delete;
+
+  unique_lock(unique_lock&& u) noexcept : m_(u.m_), owns_(u.owns_) {
+    u.m_ = nullptr;
+    u.owns_ = false;
+  }
+
+  unique_lock& operator=(unique_lock&& u) noexcept {
+    if (owns_) m_->unlock();
+    m_ = u.m_;
+    owns_ = u.owns_;
+    u.m_ = nullptr;
+    u.owns_ = false;
+    return *this;
+  }
+
+  void lock() {
+    if (m_ == nullptr)
+      throw system_error(make_error_code(errc::operation_not_permitted),
+                         "unique_lock::lock on empty lock");
+    if (owns_)
+      throw system_error(
+          make_error_code(errc::resource_deadlock_would_occur),
+          "unique_lock::lock on already-locked lock");
+    m_->lock();
+    owns_ = true;
+  }
+
+  bool try_lock() {
+    if (m_ == nullptr)
+      throw system_error(make_error_code(errc::operation_not_permitted),
+                         "unique_lock::try_lock on empty lock");
+    if (owns_)
+      throw system_error(
+          make_error_code(errc::resource_deadlock_would_occur),
+          "unique_lock::try_lock on already-locked lock");
+    owns_ = m_->try_lock();
+    return owns_;
+  }
+
+  template <typename _Rep, typename _Period>
+  bool try_lock_for(const chrono::duration<_Rep, _Period>& rel_time) {
+    if (m_ == nullptr)
+      throw system_error(make_error_code(errc::operation_not_permitted),
+                         "unique_lock::try_lock_for on empty lock");
+    if (owns_)
+      throw system_error(
+          make_error_code(errc::resource_deadlock_would_occur),
+          "unique_lock::try_lock_for on already-locked lock");
+    owns_ = m_->try_lock_for(rel_time);
+    return owns_;
+  }
+
+  template <typename _Clock, typename _Duration>
+  bool try_lock_until(const chrono::time_point<_Clock, _Duration>& abs_time) {
+    if (m_ == nullptr)
+      throw system_error(make_error_code(errc::operation_not_permitted),
+                         "unique_lock::try_lock_until on empty lock");
+    if (owns_)
+      throw system_error(
+          make_error_code(errc::resource_deadlock_would_occur),
+          "unique_lock::try_lock_until on already-locked lock");
+    owns_ = m_->try_lock_until(abs_time);
+    return owns_;
+  }
+
+  void unlock() {
+    if (!owns_)
+      throw system_error(make_error_code(errc::operation_not_permitted),
+                         "unique_lock::unlock on unlocked lock");
+    m_->unlock();
+    owns_ = false;
+  }
+
+  void swap(unique_lock& u) noexcept {
+    std::swap(m_, u.m_);
+    std::swap(owns_, u.owns_);
+  }
+
+  mutex_type* release() noexcept {
+    mutex_type* m = m_;
+    m_ = nullptr;
+    owns_ = false;
+    return m;
+  }
+
+  bool owns_lock() const noexcept { return owns_; }
+  explicit operator bool() const noexcept { return owns_; }
+  mutex_type* mutex() const noexcept { return m_; }
+
+ private:
+  mutex_type* m_;
+  bool owns_;
+};
+
+template <typename _Mutex>
+void swap(unique_lock<_Mutex>& a, unique_lock<_Mutex>& b) noexcept {
+  a.swap(b);
+}
+
+}  // namespace std
+
+#endif  // A4_PS3_SHIM_MUTEX

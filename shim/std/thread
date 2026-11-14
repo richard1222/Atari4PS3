@@ -1,0 +1,244 @@
+// Shadow <thread> for PSL1GHT.
+//
+// The ps3toolchain libstdc++ was built without gthreads, so the system
+// <thread> declares std::thread but without a usable constructor. This file
+// is found first via -I and replaces it for the Stella core build only.
+// Backed by LV2 sysThread syscalls (sysThreadCreate / Join / Detach).
+//
+// Provided: std::thread (with the variadic constructor, move semantics,
+// join/detach/joinable/get_id/hardware_concurrency/native_handle),
+// std::thread::id with comparisons, hash and ostream output, and
+// std::this_thread::{get_id, yield, sleep_for, sleep_until}.
+//
+// Thread entry: the callable and its decayed arguments are stored in a
+// heap-allocated invoker that the new thread deletes after running. An
+// exception escaping the thread function deletes the invoker and then
+// propagates out of the thread entry, which the runtime turns into
+// std::terminate, as the standard requires.
+//
+// Stack size is fixed at 256 KiB and priority 1000 (the usual PPU default).
+// hardware_concurrency() returns 2 (the PPU's two hardware threads);
+// Stella's NTSC filter subtracts one for the main thread and needs at
+// least two remaining to enable worker threads, so with 2 the filter
+// renders single-threaded -- no per-frame thread churn.
+//
+// this_thread::sleep_for/sleep_until are implemented as timed waits on a
+// private condition variable that nobody signals, because this SDK has no
+// sysTimerUsleep / nanosleep / usleep. Only OSystem's GUI main loop calls
+// sleep_until, and the libretro path never runs that loop.
+#ifndef A4_PS3_SHIM_THREAD
+#define A4_PS3_SHIM_THREAD
+
+// Keep the real libstdc++ <thread> from ever being parsed in this TU.
+#define _GLIBCXX_THREAD 1
+
+#include "__a4_detail.h"
+#include "mutex"
+#include "condition_variable"
+
+#include <chrono>
+#include <exception>
+#include <functional>
+#include <ostream>
+#include <ratio>
+#include <system_error>
+#include <tuple>
+#include <type_traits>
+#include <utility>
+
+namespace std {
+
+class thread {
+ public:
+  class id {
+    std::uint64_t value_;
+
+   public:
+    id() noexcept : value_(a4_shim::kNoThreadId) {}
+    explicit id(std::uint64_t v) noexcept : value_(v) {}
+
+    friend bool operator==(id a, id b) noexcept {
+      return a.value_ == b.value_;
+    }
+    friend bool operator!=(id a, id b) noexcept {
+      return a.value_ != b.value_;
+    }
+    friend bool operator<(id a, id b) noexcept {
+      return a.value_ < b.value_;
+    }
+    friend bool operator<=(id a, id b) noexcept {
+      return a.value_ <= b.value_;
+    }
+    friend bool operator>(id a, id b) noexcept {
+      return a.value_ > b.value_;
+    }
+    friend bool operator>=(id a, id b) noexcept {
+      return a.value_ >= b.value_;
+    }
+    template <typename _CharT, typename _Traits>
+    friend basic_ostream<_CharT, _Traits>& operator<<(
+        basic_ostream<_CharT, _Traits>& os, id i) {
+      return os << i.value_;
+    }
+    friend struct hash<id>;
+  };
+
+  typedef sys_ppu_thread_t native_handle_type;
+
+  thread() noexcept : handle_(0), seq_(a4_shim::kNoThreadId) {}
+
+  template <typename _Callable, typename... _Args>
+  explicit thread(_Callable&& f, _Args&&... args)
+      : handle_(0), seq_(a4_shim::kNoThreadId) {
+    using DecayedFn = decay_t<_Callable>;
+    using ArgTuple = tuple<decay_t<_Args>...>;
+    struct Invoker {
+      DecayedFn fn;
+      ArgTuple args;
+      std::uint64_t seq;
+      static void run(void* p) {
+        Invoker* self = static_cast<Invoker*>(p);
+        a4_shim::ThreadRegistry::instance().registerCurrent(self->seq);
+        try {
+          std::apply(
+              [&](auto&&... a) {
+                std::invoke(self->fn, std::forward<decltype(a)>(a)...);
+              },
+              self->args);
+        } catch (...) {
+          delete self;
+          throw;  // escapes the thread entry -> std::terminate
+        }
+        delete self;
+      }
+    };
+
+    const std::uint64_t seq =
+        a4_shim::ThreadRegistry::instance().allocSeq();
+    Invoker* inv = new Invoker{std::forward<_Callable>(f),
+                               ArgTuple(std::forward<_Args>(args)...), seq};
+    static char threadName[] = "a4thread";
+    sys_ppu_thread_t created = 0;
+    const s32 ret =
+        sysThreadCreate(&created, &Invoker::run, inv,
+                        1000,              // priority (usual PPU default)
+                        256 * 1024,        // stack size in bytes
+                        THREAD_JOINABLE,   // must be joinable for join()
+                        threadName);
+    if (ret != 0) {
+      delete inv;
+      throw system_error(
+          make_error_code(errc::resource_unavailable_try_again),
+          "sysThreadCreate");
+    }
+    handle_ = created;
+    seq_ = seq;
+  }
+
+  thread(const thread&) = delete;
+  thread& operator=(const thread&) = delete;
+
+  thread(thread&& other) noexcept
+      : handle_(other.handle_), seq_(other.seq_) {
+    other.handle_ = 0;
+    other.seq_ = a4_shim::kNoThreadId;
+  }
+
+  thread& operator=(thread&& other) noexcept {
+    if (joinable()) terminate();
+    handle_ = other.handle_;
+    seq_ = other.seq_;
+    other.handle_ = 0;
+    other.seq_ = a4_shim::kNoThreadId;
+    return *this;
+  }
+
+  ~thread() {
+    if (joinable()) terminate();
+  }
+
+  void swap(thread& other) noexcept {
+    std::swap(handle_, other.handle_);
+    std::swap(seq_, other.seq_);
+  }
+
+  bool joinable() const noexcept { return seq_ != a4_shim::kNoThreadId; }
+
+  void join();  // defined below, after this_thread::get_id()
+
+  void detach() {
+    if (!joinable())
+      throw system_error(make_error_code(errc::invalid_argument),
+                         "thread::detach on non-joinable thread");
+    sysThreadDetach(handle_);
+    handle_ = 0;
+    seq_ = a4_shim::kNoThreadId;
+  }
+
+  id get_id() const noexcept { return id(seq_); }
+
+  native_handle_type native_handle() { return handle_; }
+
+  static unsigned int hardware_concurrency() noexcept { return 2; }
+
+ private:
+  sys_ppu_thread_t handle_;
+  std::uint64_t seq_;
+};
+
+inline void swap(thread& a, thread& b) noexcept { a.swap(b); }
+
+template <>
+struct hash<thread::id> {
+  std::size_t operator()(thread::id i) const noexcept {
+    return hash<std::uint64_t>{}(i.value_);
+  }
+};
+
+namespace this_thread {
+
+inline thread::id get_id() noexcept {
+  return thread::id(a4_shim::ThreadRegistry::instance().currentSeq());
+}
+
+inline void yield() noexcept { sysThreadYield(); }
+
+template <typename _Rep, typename _Period>
+void sleep_for(const chrono::duration<_Rep, _Period>& rel_time) {
+  if (rel_time <= chrono::duration<_Rep, _Period>::zero()) return;
+  // Block on a condition variable nobody signals; the timed wait expires
+  // after rel_time. Concurrent sleepers share the pair safely: wait_for
+  // releases the mutex while waiting, so each sleeper waits its own span.
+  static mutex sleepMutex;
+  static condition_variable sleepCv;
+  unique_lock<mutex> lock(sleepMutex);
+  sleepCv.wait_for(lock, rel_time);
+}
+
+template <typename _Clock, typename _Duration>
+void sleep_until(const chrono::time_point<_Clock, _Duration>& abs_time) {
+  for (;;) {
+    const auto now = _Clock::now();
+    if (now >= abs_time) return;
+    sleep_for(abs_time - now);
+  }
+}
+
+}  // namespace this_thread
+
+inline void thread::join() {
+  if (!joinable())
+    throw system_error(make_error_code(errc::invalid_argument),
+                       "thread::join on non-joinable thread");
+  if (get_id() == this_thread::get_id())
+    throw system_error(make_error_code(errc::resource_deadlock_would_occur),
+                       "thread::join on current thread");
+  std::uint64_t retval = 0;
+  sysThreadJoin(handle_, &retval);
+  handle_ = 0;
+  seq_ = a4_shim::kNoThreadId;
+}
+
+}  // namespace std
+
+#endif  // A4_PS3_SHIM_THREAD

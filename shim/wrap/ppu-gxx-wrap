@@ -1,0 +1,15 @@
+#!/bin/sh
+# ppu-g++ wrapper for vendored libretro core builds (M2).
+#
+# Same idea as ppu-gcc-wrap (see that file): the core's Makefile keeps
+# its own CFLAGS/CXXFLAGS logic, and the PS3 fixes ride along here.
+# The C++ wrapper additionally supplies the gthreads shims: the
+# ps3toolchain libstdc++ was built without gthreads, so <mutex>,
+# <thread> and <condition_variable> resolve to the shadow headers in
+# shim/std (LV2 syscalls), and the C99 forced-include supplies the
+# snprintf/strtof/round family that this libstdc++ lacks. Same
+# combination the M0 Stella build proved; see shim/README.md.
+WRAP_DIR=$(dirname "$0")
+SHIM_DIR=$(cd "$WRAP_DIR/.." && pwd)
+PS3DEV="${PS3DEV:-/opt/ps3sdk}"
+exec "$PS3DEV/ppu/bin/ppu-g++" -mcpu=cell -mhard-float -U__STRICT_ANSI__ -Wno-cpp -I"$PS3DEV/ppu/include" -I"$SHIM_DIR/std" -include "$SHIM_DIR/ps3_c99_shim.h" "$@"

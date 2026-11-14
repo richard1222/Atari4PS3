@@ -1,0 +1,21 @@
+[submodule "cores/stella"]
+	path = cores/stella
+	url = https://github.com/libretro/stella2023.git
+[submodule "cores/atari800"]
+	path = cores/atari800
+	url = https://github.com/libretro/libretro-atari800.git
+[submodule "cores/prosystem"]
+	path = cores/prosystem
+	url = https://github.com/libretro/prosystem-libretro.git
+[submodule "cores/handy"]
+	path = cores/handy
+	url = https://github.com/libretro/libretro-handy.git
+[submodule "cores/hatari"]
+	path = cores/hatari
+	url = https://github.com/libretro/hatari.git
+[submodule "cores/virtualjaguar"]
+	path = cores/virtualjaguar
+	url = https://github.com/libretro/virtualjaguar-libretro.git
+[submodule "cores/dosbox-pure"]
+	path = cores/dosbox-pure
+	url = https://github.com/libretro/dosbox-pure.git

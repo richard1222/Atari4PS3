@@ -1,0 +1,1 @@
+void sysProcessExit(int);
